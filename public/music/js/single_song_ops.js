@@ -27,6 +27,14 @@ function getSongQualitySize(song, quality) {
 
 const remoteQualitySizeCache = new Map();
 
+const QUALITY_SOURCE_LABELS = {
+    tx: 'TX',
+    wy: 'WY',
+    kw: 'KW',
+    kg: 'KG',
+    mg: 'MG'
+};
+
 function getSongQualityCacheKey(song, quality) {
     const meta = song?.meta || {};
     const source = song?.source || meta.source || '';
@@ -34,8 +42,15 @@ function getSongQualityCacheKey(song, quality) {
     return `${source}:${id}:${quality}`;
 }
 
-function applySongQualitySize(song, quality, size) {
-    if (!song || !quality || !size) return;
+function getSongQualityResolvedSource(song, quality) {
+    return song?._resolvedQualitySources?.[quality] || null;
+}
+
+function applySongQualityProbe(song, quality, probe) {
+    if (!song || !quality || !probe) return;
+
+    const size = probe.size || null;
+    const source = probe.source || null;
 
     // Older favorites only contain the qualities known when they were saved.
     // Always create a canonical entry so newly supported qualities can be read
@@ -46,27 +61,40 @@ function applySongQualitySize(song, quality, size) {
     if (!song._types[quality] || typeof song._types[quality] !== 'object') {
         song._types[quality] = {};
     }
-    song._types[quality].size = size;
+    if (size) song._types[quality].size = size;
+
+    if (source) {
+        if (!song._resolvedQualitySources || typeof song._resolvedQualitySources !== 'object') {
+            song._resolvedQualitySources = {};
+        }
+        song._resolvedQualitySources[quality] = source;
+    }
 
     const maps = [song._types, song._qualitys, song.meta?._types, song.meta?._qualitys];
     maps.forEach(map => {
-        if (map?.[quality]) map[quality].size = size;
+        if (!map?.[quality]) return;
+        if (size) map[quality].size = size;
+        if (source) map[quality].resolvedSource = source;
     });
 
     const lists = [song.types, song.qualitys, song.meta?.types, song.meta?.qualitys];
     lists.forEach(list => {
         if (!Array.isArray(list)) return;
         const item = list.find(t => (t?.type || t) === quality);
-        if (item && typeof item === 'object') item.size = size;
+        if (item && typeof item === 'object') {
+            if (size) item.size = size;
+            if (source) item.resolvedSource = source;
+        }
     });
 }
 
 async function fetchRemoteQualitySize(song, quality) {
-    const existingSize = getSongQualitySize(song, quality);
-    if (existingSize) return existingSize;
-
     const cacheKey = getSongQualityCacheKey(song, quality);
-    if (remoteQualitySizeCache.has(cacheKey)) return remoteQualitySizeCache.get(cacheKey);
+    if (remoteQualitySizeCache.has(cacheKey)) {
+        const cachedProbe = remoteQualitySizeCache.get(cacheKey);
+        applySongQualityProbe(song, quality, cachedProbe);
+        return cachedProbe;
+    }
 
     try {
         const authHeaders = typeof getUserAuthHeaders === 'function' ? getUserAuthHeaders() : {};
@@ -81,10 +109,16 @@ async function fetchRemoteQualitySize(song, quality) {
         if (!res.ok) throw new Error(await res.text());
 
         const data = await res.json();
-        const size = data?.size || null;
-        if (size) applySongQualitySize(song, quality, size);
-        remoteQualitySizeCache.set(cacheKey, size);
-        return size;
+        const probe = {
+            size: data?.size || null,
+            bytes: Number(data?.bytes) || 0,
+            source: data?.source || null,
+            resolvedQuality: data?.type || quality,
+            sourceName: data?.sourceName || ''
+        };
+        applySongQualityProbe(song, quality, probe);
+        remoteQualitySizeCache.set(cacheKey, probe);
+        return probe;
     } catch (e) {
         console.warn(`[QualitySize] 获取 ${quality} 真实大小失败:`, e);
         // Do not make a transient source/network failure permanent for this tab.
@@ -94,11 +128,11 @@ async function fetchRemoteQualitySize(song, quality) {
 }
 
 async function buildQualityOptionLabels(song, qualities) {
-    const missingQualities = qualities.filter(q => !getSongQualitySize(song, q));
-    if (missingQualities.length > 0) {
+    const unresolvedQualities = qualities.filter(q => !getSongQualitySize(song, q) || !getSongQualityResolvedSource(song, q));
+    if (unresolvedQualities.length > 0) {
         window.showLoading?.('正在读取音质大小...');
         try {
-            await Promise.all(missingQualities.map(q => fetchRemoteQualitySize(song, q)));
+            await Promise.all(unresolvedQualities.map(q => fetchRemoteQualitySize(song, q)));
         } finally {
             window.hideLoading?.();
         }
@@ -109,7 +143,10 @@ async function buildQualityOptionLabels(song, qualities) {
 
 function getQualityOptionLabel(song, quality) {
     const name = window.QualityManager ? window.QualityManager.getQualityDisplayName(quality) : quality;
-    return `${name} [${getSongQualitySize(song, quality) || '未知大小'}]`;
+    const size = getSongQualitySize(song, quality) || '未知大小';
+    const source = getSongQualityResolvedSource(song, quality);
+    const sourceLabel = source ? (QUALITY_SOURCE_LABELS[source] || String(source).toUpperCase()) : '';
+    return `${name} [${size}${sourceLabel ? ` · ${sourceLabel}` : ''}]`;
 }
 
 function getSelectableQualityOrder(song = null) {
@@ -124,6 +161,11 @@ function getSelectableQualityOrder(song = null) {
 async function deleteSingleSong(songId) {
     if (!(await showSelect('删除歌曲', '确定要删除这首歌曲吗?', { danger: true }))) {
         return;
+    }
+
+    // 公开列表删除需要管理员权限
+    if (typeof requireAdminForOpenWrite === 'function') {
+        if (!(await requireAdminForOpenWrite('删除公开列表中的歌曲'))) return;
     }
 
     const activeListId = getCurrentActiveListId();
@@ -306,13 +348,29 @@ async function downloadSong(songOrId, forceQuality = null, suppressAlerts = fals
         return false;
     }
 
+    // 权限校验：公开受限模式下，如果管理员关闭了“缓存歌曲文件”功能，则下载/缓存歌曲需要验证管理员身份
+    const isPublic = !isUserLoggedIn() || !window.currentListData?.username || window.currentListData?.username === 'default' || window.currentListData?.username === '_open';
+    const enablePublicRestriction = window.lx_config?.['user.enablePublicRestriction'];
+    const isAdmin = !!localStorage.getItem('lx_admin_password');
+    const isServerCacheAllowed = window.settings?.enableServerCache === true;
+
+    if (isPublic && enablePublicRestriction && !isServerCacheAllowed && !isAdmin) {
+        showError('权限限制：管理员已关闭缓存歌曲功能，下载歌曲需要验证管理员身份。');
+        if (typeof window.handleAdminAuth === 'function') {
+            const authorized = await window.handleAdminAuth('管理员已关闭缓存歌曲文件功能，下载歌曲需要验证管理员身份');
+            if (!authorized) return false;
+        } else {
+            return false;
+        }
+    }
+
     const isOnlyDownload = window.settings?.enableOnlyDownloadMode === true;
     const actionLabel = isOnlyDownload ? '下载到服务器' : '缓存到服务器';
 
     let selected = skipPromptTarget;
     if (!selected) {
         // [优化] 检测是否已缓存
-        const prefQuality = window.settings?.preferredQuality || '320k';
+        const prefQuality = window.settings?.preferredQuality || 'flac';
         const checkResult = await window.checkServerCache?.(song, prefQuality);
         const cacheSuffix = (checkResult?.exists && !checkResult?.isCollision) ? ' (已缓存)' : '';
 
@@ -348,7 +406,7 @@ async function downloadSong(songOrId, forceQuality = null, suppressAlerts = fals
         }
     } else if (selected && (selected.startsWith('缓存到服务器') || selected.startsWith('下载到服务器'))) {
         // [优化] 检测是否已缓存
-        const prefQuality = window.settings?.preferredQuality || '320k';
+        const prefQuality = window.settings?.preferredQuality || 'flac';
         const checkResult = await window.checkServerCache?.(song, prefQuality);
         const isCached = checkResult?.exists && !checkResult?.isCollision;
 
@@ -368,16 +426,10 @@ async function downloadSong(songOrId, forceQuality = null, suppressAlerts = fals
             targetQuality = availableQualities[selectedQualityIndex];
         }
 
-        // [新增] 权限校验：受限公开用户需要验证管理员
-        const isPublic = !window.currentListData?.username || window.currentListData?.username === 'default';
-        const enablePublicRestriction = window.lx_config?.['user.enablePublicRestriction'];
-        const isAdmin = !!localStorage.getItem('lx_admin_password');
-        const isServerCacheAllowed = window.settings?.enableServerCache === true;
-
-        if (isPublic && enablePublicRestriction && !isServerCacheAllowed && !isAdmin && !isOnlyDownload) {
+        if (isPublic && enablePublicRestriction && !isServerCacheAllowed && !isAdmin) {
             showError('权限限制：缓存到服务器需要验证管理员。');
             if (typeof window.handleAdminAuth === 'function') {
-                const authorized = await window.handleAdminAuth('缓存到服务器需要验证管理员身份或开启仅下载模式');
+                const authorized = await window.handleAdminAuth('缓存到服务器需要验证管理员身份');
                 if (!authorized) return false;
             } else {
                 return false;
@@ -412,6 +464,22 @@ async function batchDownloadSongs(songsToDownload, batchOptions = {}) {
     if (!Array.isArray(songsToDownload) || songsToDownload.length === 0) {
         showError(batchOptions.emptyMessage || '未找到要下载的歌曲');
         return false;
+    }
+
+    // 权限校验：公开受限模式下，如果管理员关闭了“缓存歌曲文件”功能，则批量下载/缓存歌曲需要验证管理员身份
+    const isPublic = !isUserLoggedIn() || !window.currentListData?.username || window.currentListData?.username === 'default' || window.currentListData?.username === '_open';
+    const enablePublicRestriction = window.lx_config?.['user.enablePublicRestriction'];
+    const isAdmin = !!localStorage.getItem('lx_admin_password');
+    const isServerCacheAllowed = window.settings?.enableServerCache === true;
+
+    if (isPublic && enablePublicRestriction && !isServerCacheAllowed && !isAdmin) {
+        showError('权限限制：管理员已关闭缓存歌曲功能，批量下载需要验证管理员身份。');
+        if (typeof window.handleAdminAuth === 'function') {
+            const authorized = await window.handleAdminAuth('管理员已关闭缓存歌曲文件功能，批量下载需要验证管理员身份');
+            if (!authorized) return false;
+        } else {
+            return false;
+        }
     }
 
     const clearSelection = batchOptions.clearSelection !== false;
@@ -469,17 +537,10 @@ async function batchDownloadSongs(songsToDownload, batchOptions = {}) {
         const selectedQualityIndex = qualityDisplayNames.indexOf(selectedQualityDisplay);
         const targetQuality = availableQualities[selectedQualityIndex];
 
-        // [新增] 权限校验：受限公开用户需要验证管理员
-        const isPublic = !window.currentListData?.username || window.currentListData?.username === 'default';
-        const enablePublicRestriction = window.lx_config?.['user.enablePublicRestriction'];
-        const isAdmin = !!localStorage.getItem('lx_admin_password');
-        const isServerCacheAllowed = window.settings?.enableServerCache === true;
-        const isOnlyDownload = window.settings?.enableOnlyDownloadMode === true;
-
-        if (isPublic && enablePublicRestriction && !isServerCacheAllowed && !isAdmin && !isOnlyDownload) {
+        if (isPublic && enablePublicRestriction && !isServerCacheAllowed && !isAdmin) {
             showError('权限限制：缓存到服务器需要验证管理员。');
             if (typeof window.handleAdminAuth === 'function') {
-                const authorized = await window.handleAdminAuth('缓存到服务器需要验证管理员身份或开启仅下载模式');
+                const authorized = await window.handleAdminAuth('缓存到服务器需要验证管理员身份');
                 if (!authorized) return false;
             } else {
                 return false;
